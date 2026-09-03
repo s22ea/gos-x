@@ -153,39 +153,59 @@ function stepWander(state, args) {
   return { lat: curLat, lon: curLon, accuracy: Math.round(acc) };
 }
 
-function encodeInt64(n) {
-  var b = BigInt(Math.round(n));
-  if (b < 0n) b += 1n << 64n;
+function encodeU64(lo, hi) {
   var out = [];
-  while (b >= 0x80n) {
-    out.push(Number(b & 0x7fn) | 0x80);
-    b >>= 7n;
+  for (var i = 0; i < 10; i++) {
+    var b = lo & 0x7f;
+    lo = ((lo >>> 7) | ((hi & 0x7f) << 25)) >>> 0;
+    hi = hi >>> 7;
+    if (lo || hi) {
+      out.push(b | 0x80);
+    } else {
+      out.push(b);
+      break;
+    }
   }
-  out.push(Number(b));
   return new Uint8Array(out);
+}
+
+function encodeInt64(n) {
+  n = Math.round(Number(n) || 0);
+  var lo;
+  var hi;
+  if (n >= 0) {
+    lo = n % 4294967296;
+    if (lo < 0) lo += 4294967296;
+    hi = Math.floor(n / 4294967296);
+  } else {
+    var p = -n;
+    var plo = p % 4294967296;
+    if (plo < 0) plo += 4294967296;
+    var phi = Math.floor(p / 4294967296);
+    lo = (~plo + 1) >>> 0;
+    hi = (~phi + (lo === 0 ? 1 : 0)) >>> 0;
+  }
+  return encodeU64(lo >>> 0, hi >>> 0);
 }
 
 function encodeVarint(n) {
+  n = Math.round(Number(n) || 0);
   if (n < 0) return encodeInt64(n);
-  var out = [];
-  var v = Math.round(n);
-  while (v > 0x7f) {
-    out.push((v & 0x7f) | 0x80);
-    v = Math.floor(v / 128);
-  }
-  out.push(v & 0x7f);
-  return new Uint8Array(out);
+  return encodeU64(n % 4294967296, Math.floor(n / 4294967296));
 }
 
 function readVarint(bytes, offset) {
-  var v = 0n;
-  var s = 0n;
+  var lo = 0;
+  var hi = 0;
   for (var i = 0; i < 10; i++) {
     if (offset + i >= bytes.length) throw new Error("varint eof");
     var b = bytes[offset + i];
-    v += BigInt(b & 0x7f) << s;
-    if ((b & 0x80) === 0) return { value: v, size: i + 1 };
-    s += 7n;
+    var sh = i * 7;
+    if (sh < 32) lo |= (b & 0x7f) << sh;
+    else hi |= (b & 0x7f) << (sh - 32);
+    if ((b & 0x80) === 0) {
+      return { value: lo >>> 0, hi: hi >>> 0, size: i + 1 };
+    }
   }
   throw new Error("varint long");
 }
@@ -196,8 +216,8 @@ function parseFields(bytes) {
   while (o < bytes.length) {
     var tag = readVarint(bytes, o);
     o += tag.size;
-    var fieldNumber = Number(tag.value >> 3n);
-    var wireType = Number(tag.value & 7n);
+    var fieldNumber = tag.value >>> 3;
+    var wireType = tag.value & 7;
     var start = o - tag.size;
     if (wireType === 0) {
       var val = readVarint(bytes, o);
@@ -504,6 +524,7 @@ function rememberGood(state, bytes) {
   var args = parseArg(typeof $argument !== "undefined" ? $argument : "");
   var state = readState();
   var raw = bodyToBytes();
+  log("hit bytes=" + (raw ? raw.length : 0) + " store=" + (state ? (state.latitude + "," + state.longitude) : "empty"));
   if (!raw || !raw.length) {
     $done({});
     return;
