@@ -1,26 +1,22 @@
 /**
- * WLOC Hybrid rewriter — Shadowrocket binary-body-mode.
- *
- * Drift model (not Yu9191's independent jump):
- *   Anchor stays in wloc_settings.
- *   Each intercepted /clls/wloc takes one small step (~0.2 m/s fidget)
- *   and is clamped to wanderRadius metres (default 5).
- *   Wi-Fi + cell in the SAME response share the same offset.
- *   horizontalAccuracy also breathes so the fix is not a frozen 35.000 m.
- *
- * Encoding: Apple uses proto int64 (two's-complement varint), scale 1e8.
- * Patch policy: only lat/lon/hAcc inside existing Location submessages.
+ * Hybrid WLOC rewriter for Shadowrocket.
+ * Frame + field map follow Yu9191/dist/wloc.js.
+ * $done shape follows Yu platform adapter (Shadowrocket: { response }).
+ * Added: persistent 5 m walk, no lastGood replay, no BigInt (JSC-safe).
  */
 var STORE_KEY = "wloc_settings";
-var SCALE = 100000000;
-var WIFI_FIELD = 2;
-var CELL_FIELDS = { 22: 1, 24: 1 };
-var PREFIX = [0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
-var MARKER = [0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
+var SCALE = 1e8;
 var M_PER_DEG = 111320;
 
 function log(m) {
   try { console.log("[wloc-hybrid] " + m); } catch (e) {}
+}
+
+function platform() {
+  if (typeof $task !== "undefined") return "qx";
+  if (typeof $rocket !== "undefined") return "sr";
+  if (typeof $loon !== "undefined") return "loon";
+  return "surge";
 }
 
 function parseArg(raw) {
@@ -35,121 +31,85 @@ function parseArg(raw) {
   return out;
 }
 
-function isQx() {
-  return typeof $task !== "undefined";
-}
-
 function parseState(raw) {
   if (!raw) return null;
   try {
     var o = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (!o || !isFinite(+o.latitude) || !isFinite(+o.longitude)) return null;
+    if (!o) return null;
+    if (!isFinite(+o.latitude) || !isFinite(+o.longitude)) return null;
     return o;
   } catch (e) {
     return null;
   }
 }
 
-function readStoreRaw() {
+function readStore() {
   try {
-    if (isQx()) return $prefs.valueForKey(STORE_KEY);
-    var a = $persistentStore.read(STORE_KEY);
-    if (parseState(a)) return a;
-    var b = $persistentStore.read("wloc_settings");
-    if (parseState(b)) return b;
-    return a;
+    if (platform() === "qx") return parseState($prefs.valueForKey(STORE_KEY));
+    var s = parseState($persistentStore.read(STORE_KEY));
+    if (s) return s;
+    return parseState($persistentStore.read("wloc_settings"));
   } catch (e) {
     return null;
   }
 }
 
-function writeStoreRaw(text) {
+function writeStore(obj) {
   try {
-    if (isQx()) return $prefs.setValueForKey(text, STORE_KEY);
-    var ok = $persistentStore.write(text, STORE_KEY);
-    if (!parseState($persistentStore.read(STORE_KEY))) {
-      $persistentStore.write(STORE_KEY, text);
+    var text = JSON.stringify(obj);
+    if (platform() === "qx") {
+      $prefs.setValueForKey(text, STORE_KEY);
+      return;
     }
-    return ok !== false;
-  } catch (e) {
-    return false;
-  }
-}
-
-function readState() {
-  return parseState(readStoreRaw());
+    $persistentStore.write(text, STORE_KEY);
+    if (!parseState($persistentStore.read(STORE_KEY))) $persistentStore.write(STORE_KEY, text);
+  } catch (e) {}
 }
 
 function clamp(v, a, b) {
   return v < a ? a : v > b ? b : v;
 }
 
-function metersToDeg(lat, northM, eastM) {
-  var cos = Math.cos((lat * Math.PI) / 180);
-  if (Math.abs(cos) < 0.2) cos = cos < 0 ? -0.2 : 0.2;
-  return {
-    dLat: northM / M_PER_DEG,
-    dLon: eastM / (M_PER_DEG * cos),
-  };
-}
-
-function distM(lat1, lon1, lat2, lon2) {
-  var p = metersToDeg(lat1, 1, 1);
-  var dn = (lat2 - lat1) / p.dLat;
-  var de = (lon2 - lon1) / p.dLon;
-  return Math.sqrt(dn * dn + de * de);
-}
-
-/**
- * Persistent fidget walk inside a disk.
- * Independent Math.random() per packet (Yu9191 randomRadius) looks like teleporting.
- */
 function stepWander(state, args) {
-  var radius = +state.wanderRadius;
-  if (!isFinite(radius) || radius <= 0) radius = +args.wanderRadius;
-  if (!isFinite(radius) || radius <= 0) radius = 5;
-  radius = clamp(radius, 0.5, 50);
-
+  var lat = +state.latitude;
+  var lon = +state.longitude;
+  var radius = +state.wanderRadius || +state.randomRadius || +args.wanderRadius || +args.randomRadius || 5;
+  if (!(radius > 0)) radius = 5;
+  var accBase = +state.accuracy || +args.accuracy || 35;
   var now = Date.now();
-  var prevTs = +state.walkTs || now;
-  var dt = clamp((now - prevTs) / 1000, 0.3, 8);
-
+  var prev = +state.walkTs || now;
+  var dt = clamp((now - prev) / 1000, 0.3, 8);
   var heading = +state.walkHeading;
   if (!isFinite(heading)) heading = Math.random() * Math.PI * 2;
-  heading += (Math.random() - 0.5) * 0.7 * dt;
-
-  var speed = 0.12 + Math.random() * 0.28;
-  var step = speed * dt;
-
-  var curLat = isFinite(+state.walkLat) ? +state.walkLat : +state.latitude;
-  var curLon = isFinite(+state.walkLon) ? +state.walkLon : +state.longitude;
-  var off = metersToDeg(+state.latitude, Math.cos(heading) * step, Math.sin(heading) * step);
-  curLat += off.dLat;
-  curLon += off.dLon;
-
-  var d = distM(+state.latitude, +state.longitude, curLat, curLon);
-  if (d > radius) {
-    var pull = metersToDeg(+state.latitude, 0, 0);
-    var back = (d - radius * 0.72) / d;
-    curLat -= (curLat - state.latitude) * back;
-    curLon -= (curLon - state.longitude) * back;
+  heading += (Math.random() - 0.5) * 0.9;
+  var step = (0.12 + Math.random() * 0.18) * dt;
+  var curLat = +state.walkLat;
+  var curLon = +state.walkLon;
+  if (!isFinite(curLat) || !isFinite(curLon)) { curLat = lat; curLon = lon; }
+  var cos = Math.cos((lat * Math.PI) / 180);
+  if (Math.abs(cos) < 0.2) cos = cos < 0 ? -0.2 : 0.2;
+  curLat += (Math.cos(heading) * step) / M_PER_DEG;
+  curLon += (Math.sin(heading) * step) / (M_PER_DEG * cos);
+  var dLatM = (curLat - lat) * M_PER_DEG;
+  var dLonM = (curLon - lon) * M_PER_DEG * cos;
+  var dist = Math.sqrt(dLatM * dLatM + dLonM * dLonM);
+  if (dist > radius) {
+    var k = radius / dist;
+    curLat = lat + (dLatM * k) / M_PER_DEG;
+    curLon = lon + (dLonM * k) / (M_PER_DEG * cos);
     heading += Math.PI * (0.6 + Math.random() * 0.8);
   }
-
-  var accBase = +state.accuracy || +args.accuracy || 35;
   var acc = +state.walkAcc;
   if (!isFinite(acc)) acc = accBase;
-  acc += (Math.random() - 0.5) * 3;
-  acc = clamp(acc, Math.max(18, accBase - 12), accBase + 14);
-
+  acc = clamp(acc + (Math.random() - 0.5) * 3, Math.max(8, accBase - 12), accBase + 14);
   state.walkLat = curLat;
   state.walkLon = curLon;
   state.walkHeading = heading;
   state.walkAcc = acc;
   state.walkTs = now;
   state.wanderRadius = radius;
-  try { writeStoreRaw(JSON.stringify(state)); } catch (e) {}
-
+  state.randomRadius = radius;
+  writeStore(state);
   return { lat: curLat, lon: curLon, accuracy: Math.round(acc) };
 }
 
@@ -159,28 +119,21 @@ function encodeU64(lo, hi) {
     var b = lo & 0x7f;
     lo = ((lo >>> 7) | ((hi & 0x7f) << 25)) >>> 0;
     hi = hi >>> 7;
-    if (lo || hi) {
-      out.push(b | 0x80);
-    } else {
-      out.push(b);
-      break;
-    }
+    if (lo || hi) out.push(b | 0x80);
+    else { out.push(b); break; }
   }
   return new Uint8Array(out);
 }
 
 function encodeInt64(n) {
   n = Math.round(Number(n) || 0);
-  var lo;
-  var hi;
+  var lo, hi;
   if (n >= 0) {
-    lo = n % 4294967296;
-    if (lo < 0) lo += 4294967296;
+    lo = n % 4294967296; if (lo < 0) lo += 4294967296;
     hi = Math.floor(n / 4294967296);
   } else {
     var p = -n;
-    var plo = p % 4294967296;
-    if (plo < 0) plo += 4294967296;
+    var plo = p % 4294967296; if (plo < 0) plo += 4294967296;
     var phi = Math.floor(p / 4294967296);
     lo = (~plo + 1) >>> 0;
     hi = (~phi + (lo === 0 ? 1 : 0)) >>> 0;
@@ -195,303 +148,168 @@ function encodeVarint(n) {
 }
 
 function readVarint(bytes, offset) {
-  var lo = 0;
-  var hi = 0;
-  for (var i = 0; i < 10; i++) {
+  var lo = 0, sh = 0, i;
+  for (i = 0; i < 10; i++) {
     if (offset + i >= bytes.length) throw new Error("varint eof");
     var b = bytes[offset + i];
-    var sh = i * 7;
-    if (sh < 32) lo |= (b & 0x7f) << sh;
-    else hi |= (b & 0x7f) << (sh - 32);
-    if ((b & 0x80) === 0) {
-      return { value: lo >>> 0, hi: hi >>> 0, size: i + 1 };
-    }
+    lo += (b & 0x7f) * Math.pow(2, sh);
+    if ((b & 0x80) === 0) return { value: lo, size: i + 1 };
+    sh += 7;
   }
   throw new Error("varint long");
 }
 
+function concat(parts) {
+  var n = 0, i, o = 0;
+  for (i = 0; i < parts.length; i++) n += parts[i].length;
+  var out = new Uint8Array(n);
+  for (i = 0; i < parts.length; i++) { out.set(parts[i], o); o += parts[i].length; }
+  return out;
+}
+
 function parseFields(bytes) {
-  var fields = [];
-  var o = 0;
+  var fields = [], o = 0;
   while (o < bytes.length) {
     var tag = readVarint(bytes, o);
     o += tag.size;
-    var fieldNumber = tag.value >>> 3;
-    var wireType = tag.value & 7;
+    var fieldNo = Math.floor(tag.value / 8);
+    var wireType = tag.value % 8;
     var start = o - tag.size;
     if (wireType === 0) {
       var val = readVarint(bytes, o);
       o += val.size;
-      fields.push({ fieldNumber: fieldNumber, wireType: wireType, raw: bytes.slice(start, o) });
+      fields.push({ fieldNo: fieldNo, wireType: wireType, raw: bytes.slice(start, o) });
     } else if (wireType === 2) {
-      var len = readVarint(bytes, o);
-      o += len.size;
-      var n = Number(len.value);
-      var end = o + n;
+      var ln = readVarint(bytes, o);
+      o += ln.size;
+      var end = o + ln.value;
       if (end > bytes.length) throw new Error("len overflow");
-      fields.push({
-        fieldNumber: fieldNumber,
-        wireType: wireType,
-        raw: bytes.slice(start, end),
-        valueBytes: bytes.slice(o, end),
-      });
+      fields.push({ fieldNo: fieldNo, wireType: wireType, raw: bytes.slice(start, end), value: bytes.slice(o, end) });
       o = end;
     } else if (wireType === 1) {
-      o += 8;
-      fields.push({ fieldNumber: fieldNumber, wireType: wireType, raw: bytes.slice(start, o) });
+      o += 8; if (o > bytes.length) throw new Error("64 eof");
+      fields.push({ fieldNo: fieldNo, wireType: wireType, raw: bytes.slice(start, o) });
     } else if (wireType === 5) {
-      o += 4;
-      fields.push({ fieldNumber: fieldNumber, wireType: wireType, raw: bytes.slice(start, o) });
-    } else {
-      throw new Error("wire " + wireType);
-    }
+      o += 4; if (o > bytes.length) throw new Error("32 eof");
+      fields.push({ fieldNo: fieldNo, wireType: wireType, raw: bytes.slice(start, o) });
+    } else throw new Error("wire " + wireType);
   }
   return fields;
 }
 
-function concat(parts) {
-  var n = 0;
-  var i;
-  for (i = 0; i < parts.length; i++) n += parts[i].length;
-  var out = new Uint8Array(n);
-  var o = 0;
-  for (i = 0; i < parts.length; i++) {
-    out.set(parts[i], o);
-    o += parts[i].length;
-  }
-  return out;
+function fieldVarint(num, value) { return concat([encodeVarint(num * 8), encodeInt64(value)]); }
+function fieldLen(num, payload) { return concat([encodeVarint(num * 8 + 2), encodeVarint(payload.length), payload]); }
+function sameBytes(a, b) {
+  if (a.length !== b.length) return false;
+  for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
-function makeVarintField(num, value) {
-  return concat([encodeVarint(num * 8), encodeInt64(value)]);
-}
-
-function makeLenField(num, payload) {
-  return concat([encodeVarint(num * 8 + 2), encodeVarint(payload.length), payload]);
-}
-
-function coordToInt(x) {
-  return Math.round(x * SCALE);
-}
-
-function patchLocation(payload, cfg) {
-  var fields;
-  try {
-    fields = parseFields(payload);
-  } catch (e) {
-    return payload;
-  }
-  var hasLat = false;
-  var hasLon = false;
-  var i;
+function patchLocation(payload, cfg, stats) {
+  var fields; try { fields = parseFields(payload); } catch (e) { return payload; }
+  var hasLat = false, hasLon = false, i;
   for (i = 0; i < fields.length; i++) {
-    if (fields[i].fieldNumber === 1 && fields[i].wireType === 0) hasLat = true;
-    if (fields[i].fieldNumber === 2 && fields[i].wireType === 0) hasLon = true;
+    if (fields[i].fieldNo === 1 && fields[i].wireType === 0) hasLat = true;
+    if (fields[i].fieldNo === 2 && fields[i].wireType === 0) hasLon = true;
   }
   if (!hasLat || !hasLon) return payload;
   var parts = [];
   for (i = 0; i < fields.length; i++) {
     var f = fields[i];
-    if (f.fieldNumber === 1 && f.wireType === 0) parts.push(makeVarintField(1, coordToInt(cfg.lat)));
-    else if (f.fieldNumber === 2 && f.wireType === 0) parts.push(makeVarintField(2, coordToInt(cfg.lon)));
-    else if (f.fieldNumber === 3 && f.wireType === 0) parts.push(makeVarintField(3, cfg.accuracy));
+    if (f.fieldNo === 1 && f.wireType === 0) parts.push(fieldVarint(1, Math.round(cfg.lat * SCALE)));
+    else if (f.fieldNo === 2 && f.wireType === 0) parts.push(fieldVarint(2, Math.round(cfg.lon * SCALE)));
+    else if (f.fieldNo === 3 && f.wireType === 0) parts.push(fieldVarint(3, cfg.accuracy));
+    else parts.push(f.raw);
+  }
+  stats.locations++;
+  return concat(parts);
+}
+
+function patchWifi(payload, cfg, stats) {
+  var fields = parseFields(payload), parts = [], i;
+  for (i = 0; i < fields.length; i++) {
+    var f = fields[i];
+    if (f.fieldNo === 2 && f.wireType === 2) { parts.push(fieldLen(2, patchLocation(f.value, cfg, stats))); stats.wifi++; }
     else parts.push(f.raw);
   }
   return concat(parts);
 }
 
-function patchWifi(payload, cfg) {
-  var fields = parseFields(payload);
-  var parts = [];
-  for (var i = 0; i < fields.length; i++) {
+function patchCell(payload, cfg, stats) {
+  var fields = parseFields(payload), parts = [], i;
+  for (i = 0; i < fields.length; i++) {
     var f = fields[i];
-    if (f.fieldNumber === 2 && f.wireType === 2) parts.push(makeLenField(2, patchLocation(f.valueBytes, cfg)));
+    if (f.fieldNo === 5 && f.wireType === 2) { parts.push(fieldLen(5, patchLocation(f.value, cfg, stats))); stats.cell++; }
     else parts.push(f.raw);
   }
   return concat(parts);
 }
 
-function patchCell(payload, cfg) {
-  var fields = parseFields(payload);
-  var parts = [];
-  for (var i = 0; i < fields.length; i++) {
+function patchRoot(payload, cfg, stats) {
+  var fields = parseFields(payload), parts = [], i;
+  for (i = 0; i < fields.length; i++) {
     var f = fields[i];
-    if (f.fieldNumber === 5 && f.wireType === 2) parts.push(makeLenField(5, patchLocation(f.valueBytes, cfg)));
+    if (f.fieldNo === 2 && f.wireType === 2) parts.push(fieldLen(2, patchWifi(f.value, cfg, stats)));
+    else if ((f.fieldNo === 22 || f.fieldNo === 24) && f.wireType === 2) parts.push(fieldLen(f.fieldNo, patchCell(f.value, cfg, stats)));
     else parts.push(f.raw);
   }
   return concat(parts);
 }
 
-function patchRoot(payload, cfg) {
-  var fields = parseFields(payload);
-  var parts = [];
-  var wifi = 0;
-  var cell = 0;
-  for (var i = 0; i < fields.length; i++) {
-    var f = fields[i];
-    if (f.fieldNumber === WIFI_FIELD && f.wireType === 2) {
-      parts.push(makeLenField(WIFI_FIELD, patchWifi(f.valueBytes, cfg)));
-      wifi++;
-    } else if (CELL_FIELDS[f.fieldNumber] && f.wireType === 2) {
-      parts.push(makeLenField(f.fieldNumber, patchCell(f.valueBytes, cfg)));
-      cell++;
-    } else {
-      parts.push(f.raw);
-    }
-  }
-  return { payload: concat(parts), wifi: wifi, cell: cell };
-}
-
-function u16(n) {
-  return new Uint8Array([(n >> 8) & 255, n & 255]);
-}
-
-function looksPb(bytes) {
-  if (!bytes || !bytes.length) return false;
-  var fn = bytes[0] >> 3;
-  var wt = bytes[0] & 7;
-  return fn > 0 && (wt === 0 || wt === 2);
-}
-
-function tryPrefixedFrame(bytes, base) {
-  if (base + 10 > bytes.length) return null;
-  if (bytes[base] !== 0 || bytes[base + 1] !== 1) return null;
-  var len = (bytes[base + 8] << 8) | bytes[base + 9];
+function patchFrame(bytes, base, cfg) {
+  if (bytes.length < base + 10) return null;
+  var len = ((bytes[base + 8] & 255) << 8) | (bytes[base + 9] & 255);
   if (len <= 0 || base + 10 + len > bytes.length) return null;
+  var head = bytes.slice(0, base + 8);
   var payload = bytes.slice(base + 10, base + 10 + len);
-  try {
-    parseFields(payload);
-    return {
-      kind: "prefix",
-      payload: payload,
-      prefix: bytes.slice(0, base + 8),
-      suffix: bytes.slice(base + 10 + len),
-    };
-  } catch (e) {
-    return null;
-  }
+  var tail = bytes.slice(base + 10 + len);
+  var stats = { wifi: 0, cell: 0, locations: 0 };
+  var patched = patchRoot(payload, cfg, stats);
+  if (stats.locations <= 0 || sameBytes(payload, patched)) return null;
+  if (patched.length > 65535) return null;
+  return { bytes: concat([head, new Uint8Array([patched.length >> 8, patched.length & 255]), patched, tail]), stats: stats, offset: base };
 }
 
-function extract(bytes) {
-  var framed = tryPrefixedFrame(bytes, 0);
-  if (framed) return framed;
-  var off;
-  for (off = 2; off <= 16 && off + 10 < bytes.length; off += 2) {
-    framed = tryPrefixedFrame(bytes, off);
-    if (framed) return framed;
+function patchScan(bytes, cfg) {
+  var max = Math.min(256, bytes.length), off;
+  for (off = 0; off <= max; off++) {
+    try {
+      var stats = { wifi: 0, cell: 0, locations: 0 };
+      var slice = bytes.slice(off);
+      var patched = patchRoot(slice, cfg, stats);
+      if (stats.locations > 0 && !sameBytes(slice, patched)) return { bytes: concat([bytes.slice(0, off), patched]), stats: stats, offset: off };
+    } catch (e) {}
   }
-  if (bytes.length >= 10 && bytes[0] === 0 && bytes[1] === 1 && bytes[6] === 0 && bytes[7] === 0) {
-    var len = (bytes[8] << 8) | bytes[9];
-    if (len > 0 && 10 + len <= bytes.length) {
-      var payload = bytes.slice(10, 10 + len);
-      try {
-        parseFields(payload);
-        return { kind: "prefix", payload: payload, prefix: bytes.slice(0, 8), suffix: bytes.slice(10 + len) };
-      } catch (e) {}
-    }
-  }
+  return null;
+}
+
+function applyPatch(bytes, cfg) {
+  var offsets = [0, 2, 4, 6, 8, 10, 12, 14, 16];
+  var extra = Math.min(96, Math.max(0, bytes.length - 10));
   var i;
-  for (i = 0; i + 8 < bytes.length; i++) {
-    var ok = true;
-    var j;
-    for (j = 0; j < MARKER.length; j++) {
-      if (bytes[i + j] !== MARKER[j]) {
-        ok = false;
-        break;
-      }
-    }
-    if (!ok) continue;
-    var ln = (bytes[i + 6] << 8) | bytes[i + 7];
-    var start = i + 8;
-    if (ln > 0 && start + ln <= bytes.length) {
-      var cand = bytes.slice(start, start + ln);
-      try {
-        parseFields(cand);
-        return {
-          kind: "marker",
-          payload: cand,
-          prefix: bytes.slice(0, i),
-          marker: bytes.slice(i, i + 6),
-          suffix: bytes.slice(start + ln),
-        };
-      } catch (e) {}
-    }
+  for (i = 0; i <= extra; i++) if (offsets.indexOf(i) < 0) offsets.push(i);
+  for (i = 0; i < offsets.length; i++) {
+    try { var framed = patchFrame(bytes, offsets[i], cfg); if (framed) return framed; } catch (e) {}
   }
-  if (looksPb(bytes)) {
-    try {
-      parseFields(bytes);
-      return { kind: "bare", payload: bytes };
-    } catch (e) {}
-  }
-  return null;
+  return patchScan(bytes, cfg);
 }
 
-function rebuild(ext, payload) {
-  if (ext.kind === "marker") {
-    return concat([ext.prefix, ext.marker, u16(payload.length), payload, ext.suffix]);
-  }
-  if (ext.kind === "prefix") {
-    return concat([ext.prefix || new Uint8Array(PREFIX), u16(payload.length), payload, ext.suffix || new Uint8Array(0)]);
-  }
-  return concat([new Uint8Array(PREFIX), u16(payload.length), payload]);
-}
-
-function scanPatch(bytes, cfg) {
-  var limit = Math.min(bytes.length - 8, 256);
-  for (var off = 0; off <= limit; off++) {
-    var slice = bytes.slice(off);
-    if (!looksPb(slice)) continue;
-    try {
-      var r = patchRoot(slice, cfg);
-      if (r.wifi || r.cell) return { payload: r.payload, wifi: r.wifi, cell: r.cell, offset: off };
-    } catch (e) {}
-  }
-  return null;
-}
-
-function bodyToBytes() {
+function toBytes() {
   var msg = $response || {};
   if (msg.bodyBytes instanceof Uint8Array) return msg.bodyBytes;
   if (msg.bodyBytes && typeof msg.bodyBytes.length === "number") return new Uint8Array(msg.bodyBytes);
+  if (msg.rawBody instanceof Uint8Array) return msg.rawBody;
   if (typeof msg.body === "string") {
-    var u = new Uint8Array(msg.body.length);
-    for (var i = 0; i < msg.body.length; i++) u[i] = msg.body.charCodeAt(i) & 255;
+    var u = new Uint8Array(msg.body.length), i;
+    for (i = 0; i < msg.body.length; i++) u[i] = msg.body.charCodeAt(i) & 255;
     return u;
   }
   return null;
 }
 
-function bytesToBinary(u8) {
-  var cs = 0x8000;
-  var parts = [];
-  for (var i = 0; i < u8.length; i += cs) {
-    parts.push(String.fromCharCode.apply(null, Array.prototype.slice.call(u8.subarray(i, i + cs))));
-  }
-  return parts.join("");
-}
+function donePass() { $done({}); }
 
-function b64Encode(u8) {
-  var bin = bytesToBinary(u8);
-  try {
-    return btoa(bin);
-  } catch (e) {
-    return "";
-  }
-}
-
-function b64Decode(s) {
-  try {
-    var bin = atob(s);
-    var u = new Uint8Array(bin.length);
-    for (var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i) & 255;
-    return u;
-  } catch (e) {
-    return null;
-  }
-}
-
-function finish(bytes) {
-  var bin = bytesToBinary(bytes);
+function donePatched(bytes) {
   var headers = ($response && $response.headers) ? $response.headers : {};
   try { delete headers["Content-Encoding"]; } catch (e) {}
   try { delete headers["content-encoding"]; } catch (e) {}
@@ -499,73 +317,45 @@ function finish(bytes) {
   try { delete headers["transfer-encoding"]; } catch (e) {}
   headers["Content-Encoding"] = "identity";
   headers["Content-Length"] = String(bytes.length);
-  if (isQx()) {
+  var plat = platform();
+  if (plat === "qx") {
+    var bin = "", i;
+    for (i = 0; i < bytes.length; i += 32768) bin += String.fromCharCode.apply(null, Array.prototype.slice.call(bytes.subarray(i, i + 32768)));
     $done({ body: bin, headers: headers, status: "HTTP/1.1 200 OK" });
     return;
   }
   if ($response) {
-    $response.body = bin;
+    $response.body = bytes;
     $response.bodyBytes = bytes;
     $response.rawBody = bytes;
     $response.headers = headers;
     $response.status = 200;
     $response.statusCode = 200;
   }
-  $done({ response: $response || { status: 200, headers: headers, body: bin, bodyBytes: bytes } });
-}
-
-function rememberGood(state, bytes) {
-  // Do not persist the raw Apple body. A stale BSSID/cell list replayed
-  // minutes later is a common silent failure mode, and 40–70KB blows
-  // Shadowrocket persistentStore.
+  if (plat === "sr" || plat === "surge" || plat === "loon") {
+    $done({ response: $response || { status: 200, headers: headers, body: bytes, bodyBytes: bytes } });
+    return;
+  }
+  $done($response || { body: bytes, bodyBytes: bytes, headers: headers });
 }
 
 (function main() {
-  var args = parseArg(typeof $argument !== "undefined" ? $argument : "");
-  var state = readState();
-  var raw = bodyToBytes();
-  log("hit bytes=" + (raw ? raw.length : 0) + " store=" + (state ? (state.latitude + "," + state.longitude) : "empty"));
-  if (!raw || !raw.length) {
-    $done({});
-    return;
-  }
-  if (raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b) {
-    log("gzip body still compressed; client did not decode. cannot patch");
-    $done({});
-    return;
-  }
-  if (!state) {
-    log("no target; passthrough");
-    $done({});
-    return;
-  }
-
-  var cfg = stepWander(state, args);
   try {
-    var result = null;
-    var ext = extract(raw);
-    if (ext) {
-      var patched = patchRoot(ext.payload, cfg);
-      if (patched.wifi || patched.cell) {
-        result = { bytes: rebuild(ext, patched.payload), wifi: patched.wifi, cell: patched.cell, kind: ext.kind };
-      }
-    }
-    if (!result) {
-      var scanned = scanPatch(raw, cfg);
-      if (scanned) {
-        result = {
-          bytes: concat([raw.slice(0, scanned.offset), scanned.payload]),
-          wifi: scanned.wifi,
-          cell: scanned.cell,
-          kind: "scan",
-        };
-      }
-    }
+    if (typeof $response === "undefined") { donePass(); return; }
+    var args = parseArg(typeof $argument !== "undefined" ? $argument : "");
+    var state = readStore();
+    var raw = toBytes();
+    log("hit bytes=" + (raw ? raw.length : 0) + " store=" + (state ? state.latitude + "," + state.longitude : "empty"));
+    if (!raw || !raw.length) { donePass(); return; }
+    if (raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b) { log("gzip still compressed"); donePass(); return; }
+    if (!state) { log("no target; passthrough"); donePass(); return; }
+    var cfg = stepWander(state, args);
+    var result = applyPatch(raw, cfg);
     if (!result) throw new Error("no patchable fields");
-    log("ok " + result.kind + " wifi=" + result.wifi + " cell=" + result.cell + " acc=" + cfg.accuracy + " -> " + cfg.lat.toFixed(6) + "," + cfg.lon.toFixed(6));
-    finish(result.bytes);
+    log("ok off=" + result.offset + " wifi=" + result.stats.wifi + " cell=" + result.stats.cell + " loc=" + result.stats.locations + " -> " + cfg.lat.toFixed(6) + "," + cfg.lon.toFixed(6));
+    donePatched(result.bytes);
   } catch (e) {
     log("fail " + e.message);
-    $done({});
+    donePass();
   }
 })();
