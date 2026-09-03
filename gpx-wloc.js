@@ -39,9 +39,25 @@ function isQx() {
   return typeof $task !== "undefined";
 }
 
+function parseState(raw) {
+  if (!raw) return null;
+  try {
+    var o = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!o || !isFinite(+o.latitude) || !isFinite(+o.longitude)) return null;
+    return o;
+  } catch (e) {
+    return null;
+  }
+}
+
 function readStoreRaw() {
   try {
-    return isQx() ? $prefs.valueForKey(STORE_KEY) : $persistentStore.read(STORE_KEY);
+    if (isQx()) return $prefs.valueForKey(STORE_KEY);
+    var a = $persistentStore.read(STORE_KEY);
+    if (parseState(a)) return a;
+    var b = $persistentStore.read("wloc_settings");
+    if (parseState(b)) return b;
+    return a;
   } catch (e) {
     return null;
   }
@@ -49,22 +65,19 @@ function readStoreRaw() {
 
 function writeStoreRaw(text) {
   try {
-    return isQx() ? $prefs.setValueForKey(text, STORE_KEY) : $persistentStore.write(text, STORE_KEY);
+    if (isQx()) return $prefs.setValueForKey(text, STORE_KEY);
+    var ok = $persistentStore.write(text, STORE_KEY);
+    if (!parseState($persistentStore.read(STORE_KEY))) {
+      $persistentStore.write(STORE_KEY, text);
+    }
+    return ok !== false;
   } catch (e) {
     return false;
   }
 }
 
 function readState() {
-  var raw = readStoreRaw();
-  if (!raw) return null;
-  try {
-    var o = JSON.parse(raw);
-    if (!isFinite(+o.latitude) || !isFinite(+o.longitude)) return null;
-    return o;
-  } catch (e) {
-    return null;
-  }
+  return parseState(readStoreRaw());
 }
 
 function clamp(v, a, b) {
@@ -520,7 +533,7 @@ function rememberGood(state, bytes) {
       }
     }
     if (!result) throw new Error("no patchable fields");
-    log("ok " + result.kind + " wifi=" + result.wifi + " cell=" + result.cell + " acc=" + cfg.accuracy);
+    log("ok " + result.kind + " wifi=" + result.wifi + " cell=" + result.cell + " acc=" + cfg.accuracy + " -> " + cfg.lat.toFixed(6) + "," + cfg.lon.toFixed(6));
     finish(result.bytes);
   } catch (e) {
     log("fail " + e.message);
