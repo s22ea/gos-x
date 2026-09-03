@@ -20,10 +20,23 @@ function platform() {
   return "unknown";
 }
 
+function looksState(raw) {
+  try {
+    const o = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return !!(o && Number.isFinite(+o.latitude) && Number.isFinite(+o.longitude));
+  } catch (e) {
+    return false;
+  }
+}
+
 function readStore() {
   try {
     if (platform() === "qx") return $prefs.valueForKey(STORE_KEY);
-    return $persistentStore.read(STORE_KEY);
+    const a = $persistentStore.read(STORE_KEY);
+    if (looksState(a)) return typeof a === "string" ? a : JSON.stringify(a);
+    const b = $persistentStore.read("wloc_settings");
+    if (looksState(b)) return typeof b === "string" ? b : JSON.stringify(b);
+    return typeof a === "string" ? a : (a ? JSON.stringify(a) : null);
   } catch (e) {
     return null;
   }
@@ -31,8 +44,12 @@ function readStore() {
 
 function writeStore(text) {
   try {
-    if (platform() === "qx") return $prefs.setValueForKey(text, STORE_KEY);
-    return $persistentStore.write(text, STORE_KEY);
+    if (platform() === "qx") return !!$prefs.setValueForKey(text, STORE_KEY);
+    $persistentStore.write(text, STORE_KEY);
+    if (!looksState($persistentStore.read(STORE_KEY))) {
+      $persistentStore.write(STORE_KEY, text);
+    }
+    return looksState(readStore());
   } catch (e) {
     return false;
   }
