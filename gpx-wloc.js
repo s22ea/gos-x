@@ -480,10 +480,18 @@ function finish(bytes) {
   headers["Content-Encoding"] = "identity";
   headers["Content-Length"] = String(bytes.length);
   if (isQx()) {
-    $done({ body: bin, headers: headers });
+    $done({ body: bin, headers: headers, status: "HTTP/1.1 200 OK" });
     return;
   }
-  $done({ body: bin, bodyBytes: bytes, headers: headers });
+  if ($response) {
+    $response.body = bin;
+    $response.bodyBytes = bytes;
+    $response.rawBody = bytes;
+    $response.headers = headers;
+    $response.status = 200;
+    $response.statusCode = 200;
+  }
+  $done({ response: $response || { status: 200, headers: headers, body: bin, bodyBytes: bytes } });
 }
 
 function rememberGood(state, bytes) {
