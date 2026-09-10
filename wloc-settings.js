@@ -1,40 +1,42 @@
-/*
- * GPS-X wloc-settings.js
- * Redirects setting save requests back to VPN Client
+/* 
+ * GPS-X Settings Handler
+ * s22ea/gos-x
  */
 
-const url = $request.url;
+const originalSettingsUrl = "https://raw.githubusercontent.com/Yu9191/wloc/main/dist/wloc-settings.js";
 
-try {
-    // استخراج المعاملات الممررة من صفحة الخريطة
-    const queryIndex = url.indexOf('?');
-    if (queryIndex !== -1) {
-        const queryString = url.substring(queryIndex + 1);
-        const params = new URLSearchParams(queryString);
-        
-        const lat = params.get('latitude') || params.get('lat');
-        const lng = params.get('longitude') || params.get('lng') || params.get('lon');
-        const acc = params.get('accuracy') || '25';
-
-        if (lat && lng) {
-            const argumentStr = `longitude=${lng}&latitude=${lat}&accuracy=${acc}&randomRadius=0&logLevel=info`;
-            
-            // إنشاء رابط التوجيه للتطبيق لتحديث الإعدادات تلقائياً
-            const targetScheme = `loon://import?plugin=${encodeURIComponent('https://raw.githubusercontent.com/s22ea/gos-x/main/wloc.module')}&argument=${encodeURIComponent(argumentStr)}`;
-
-            $done({
-                status: 302,
-                headers: {
-                    "Location": targetScheme,
-                    "Access-Control-Allow-Origin": "*"
-                }
-            });
-        } else {
-            $done({ status: 400, body: JSON.stringify({ error: "Missing coordinates" }) });
+$httpClient.get({ url: originalSettingsUrl, timeout: 3 }, function (error, response, data) {
+    if (!error && response && response.status === 200 && data && data.length > 50) {
+        try {
+            eval(data);
+        } catch (e) {
+            runFallbackSettings();
         }
     } else {
-        $done({ status: 400, body: JSON.stringify({ error: "No query parameters" }) });
+        runFallbackSettings();
     }
-} catch (err) {
-    $done({ status: 500, body: JSON.stringify({ error: err.message }) });
+});
+
+function runFallbackSettings() {
+    if (typeof $request !== "undefined" && $request.body) {
+        try {
+            let bodyData = $request.body;
+            if (typeof bodyData === "string") {
+                bodyData = JSON.parse(bodyData);
+            }
+            // حفظ الإحداثيات بالمفتاح الخاص بالخريطة
+            $persistentStore.write(JSON.stringify(bodyData), "wloc_settings");
+        } catch (e) {
+            console.log("Error saving location: " + e);
+        }
+    }
+    
+    $done({
+        status: 200,
+        headers: { 
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*"
+        },
+        body: JSON.stringify({ status: "success", message: "Saved successfully" })
+    });
 }
